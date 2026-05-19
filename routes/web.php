@@ -33,7 +33,7 @@ Route::middleware('auth')->group(function () {
 | Trading System Routes
 |--------------------------------------------------------------------------
 */
-
+Route::middleware(['auth'])->group(function () {
 Route::get('/dashboard', [TradingSessionController::class, 'index'])->name('dashboard');
 
 Route::prefix('api/trading')->name('trading.')->group(function () {
@@ -43,7 +43,7 @@ Route::prefix('api/trading')->name('trading.')->group(function () {
     Route::put('/settings',     [TradingSessionController::class, 'updateSettings'])->name('settings');
     Route::post('/reset',       [TradingSessionController::class, 'reset'])->name('reset');
 });
-
+});
 
 
 require __DIR__.'/auth.php';
