@@ -34,6 +34,7 @@ class TradingSessionController extends Controller
                 'live_prices' => [],
                 'yest_closes' => [],
                 'live_atrs' => [],
+                'is_active' => true
             ]);
         }
 
@@ -212,7 +213,8 @@ class TradingSessionController extends Controller
         ]);
 
         $session = TradingSession::where('is_active', true)->latest()->firstOrFail();
-        $session->update($data);
+        $session->update($data)
+        ;
 
         return response()->json(['session' => $this->sessionPayload($session->fresh())]);
     }
