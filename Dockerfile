@@ -23,17 +23,16 @@ COPY . .
 # Install PHP deps
 RUN composer install --no-dev --optimize-autoloader
 
-# Install frontend deps
-RUN npm install
+# Install frontend deps & build Vite
+RUN npm install && npm run build
 
-# Build Vite
-RUN npm run build
-
-# Laravel optimizations
-RUN php artisan config:clear
-RUN php artisan route:clear
-RUN php artisan view:clear
+# DO NOT run artisan commands that need env vars at build time
+# Move them to startup instead
 
 EXPOSE 10000
 
-CMD php artisan serve --host=0.0.0.0 --port=$PORT
+CMD php artisan config:cache && \
+    php artisan route:cache && \
+    php artisan view:cache && \
+    php artisan migrate --force && \
+    php artisan serve --host=0.0.0.0 --port=$PORT
