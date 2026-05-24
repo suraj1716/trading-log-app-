@@ -44,7 +44,7 @@ class TradingEngine
         return 0;
     }
 
-    private static function detectStrongMomentum(array $prices, array $atrs, int $idx, int $lb = 7): array
+    private static function detectStrongMomentum(array $prices, array $atrs, int $idx, int $lb = 14): array
     {
         if (count($prices) < 2) return ['signal' => 0, 'score' => 0];
         $mom = $idx >= $lb ? $prices[$idx] - $prices[$idx - $lb] : 0;
