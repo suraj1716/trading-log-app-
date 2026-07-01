@@ -13,6 +13,10 @@ class TradeLog extends Model
         'buy_l1_price', 'buy_l1_qty', 'buy_l2_price', 'buy_l2_qty', 'buy_l3_price', 'buy_l3_qty',
         'sell_l1_price', 'sell_l1_qty', 'sell_l2_price', 'sell_l2_qty', 'sell_l3_price', 'sell_l3_qty',
         'cash', 'shares', 'equity', 'peak_equity', 'drawdown_pct', 'realized_pl', 'unrealized_pl', 'trade_type',
+          'regime',
+    'mom_direction',
+    'trail_stop',
+    'mom_peak_price',
     ];
 
     protected $casts = [
@@ -33,6 +37,8 @@ class TradeLog extends Model
         'drawdown_pct' => 'float',
         'realized_pl' => 'float',
         'unrealized_pl' => 'float',
+         'trail_stop' => 'float',
+    'mom_peak_price' => 'float',
     ];
 
     public function tradingSession(): BelongsTo

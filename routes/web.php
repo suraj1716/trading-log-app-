@@ -3,6 +3,7 @@
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\TradingSessionController;
 use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 
@@ -45,5 +46,5 @@ Route::prefix('api/trading')->name('trading.')->group(function () {
 });
 });
 
-
+require __DIR__.'/bot.php';
 require __DIR__.'/auth.php';

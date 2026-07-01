@@ -1,11 +1,10 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   LineChart, Line, AreaChart, Area, XAxis, YAxis,
   Tooltip, ResponsiveContainer, ReferenceLine, BarChart, Bar, Cell
 } from "recharts";
 import AuthenticatedLayout from "@/Layouts/AuthenticatedLayout";
 
-// ─── THEME ───────────────────────────────────────────────────────────────────
 const C = {
   bg:       "#0a0b0e",
   surface:  "#0f1117",
@@ -27,18 +26,67 @@ const C = {
 const mono = { fontFamily: "'JetBrains Mono', 'Fira Code', monospace" };
 const r2   = (v) => Math.round((v ?? 0) * 100) / 100;
 
-// ─── API HELPER ───────────────────────────────────────────────────────────────
-async function apiCall(method, url, data) {
-  const token = document.querySelector('meta[name="csrf-token"]')?.content ?? "";
-  const res = await fetch(url, {
-    method,
-    headers: { "Content-Type": "application/json", "X-CSRF-TOKEN": token, Accept: "application/json" },
-    body: data ? JSON.stringify(data) : undefined,
-  });
-  return res.json();
+// ── Normalise settings: accept both snake_case (from DB) and camelCase ────────
+function normSettings(raw = {}) {
+  return {
+    ticker:             raw.ticker             ?? raw.ticker             ?? "—",
+    initialShares:      raw.initialShares      ?? raw.initial_shares     ?? 0,
+    initialCash:        raw.initialCash        ?? raw.initial_cash       ?? 0,
+    tradeFee:           raw.tradeFee           ?? raw.trade_fee          ?? 5,
+    minFeeCover:        raw.minFeeCover        ?? raw.min_fee_cover      ?? 2,
+    minMoveAtrMult:     raw.minMoveAtrMult     ?? raw.min_move_atr_mult  ?? 0.15,
+    momentumLookback:   raw.momentumLookback   ?? raw.momentum_lookback  ?? 3,
+    strongMomLookback:  raw.strongMomLookback  ?? raw.strong_mom_lookback ?? 7,
+    minQty:             raw.minQty             ?? raw.min_qty            ?? 5,
+    minBuyDipPct:       raw.minBuyDipPct       ?? raw.min_buy_dip_pct    ?? 0,
+    atrLevels:          raw.atrLevels          ?? raw.atr_levels         ?? [0.5, 1.0, 1.5],
+    baseFractions:      raw.baseFractions      ?? raw.base_fractions     ?? [0.3, 0.4, 0.3],
+    maxDrawdown:        raw.maxDrawdown        ?? raw.max_drawdown       ?? 0.25,
+    maxTicks:           raw.maxTicks           ?? raw.max_ticks          ?? 50,
+  };
 }
 
-// ─── ATOMS ───────────────────────────────────────────────────────────────────
+async function apiCall(method, url, data) {
+    // Get fresh CSRF token first
+    const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+
+    console.log('[apiCall]', method, url, 'csrf token:', token ? token.substring(0, 10) + '...' : 'MISSING');
+
+    const res = await fetch(url, {
+        method,
+        headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-TOKEN': token,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
+        },
+        body: data ? JSON.stringify(data) : undefined,
+    });
+
+    // CSRF expired — refresh token and retry once
+    if (res.status === 419) {
+        console.warn('[apiCall] 419 CSRF mismatch — refreshing token and retrying...');
+        await fetch('/sanctum/csrf-cookie');                          // re-hydrate cookie
+        const freshToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+
+        const retry = await fetch(url, {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': freshToken,
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json',
+            },
+            body: data ? JSON.stringify(data) : undefined,
+        });
+        return retry.json();
+    }
+
+    return res.json();
+}
+
+// ─── UI primitives ────────────────────────────────────────────────────────────
+
 function Tag({ children, color = C.muted, bg = "transparent" }) {
   return (
     <span style={{
@@ -107,11 +155,11 @@ function Input({ label, value, onChange, type = "number", step = "0.01", options
 
 function Btn({ children, onClick, variant = "default", disabled, style = {} }) {
   const v = {
-    default: { background: C.panel,         border: `1px solid ${C.borderHi}`, color: C.text  },
-    primary: { background: C.buy  + "22",   border: `1px solid ${C.buy}55`,    color: C.buy   },
-    danger:  { background: C.red  + "15",   border: `1px solid ${C.red}55`,    color: C.red   },
-    sell:    { background: C.sell + "18",   border: `1px solid ${C.sell}55`,   color: C.sell  },
-    amber:   { background: C.amber + "18",  border: `1px solid ${C.amber}55`,  color: C.amber },
+    default: { background: C.panel,        border: `1px solid ${C.borderHi}`, color: C.text  },
+    primary: { background: C.buy  + "22",  border: `1px solid ${C.buy}55`,    color: C.buy   },
+    danger:  { background: C.red  + "15",  border: `1px solid ${C.red}55`,    color: C.red   },
+    sell:    { background: C.sell + "18",  border: `1px solid ${C.sell}55`,   color: C.sell  },
+    amber:   { background: C.amber + "18", border: `1px solid ${C.amber}55`,  color: C.amber },
   };
   return (
     <button onClick={onClick} disabled={disabled}
@@ -169,29 +217,42 @@ function Toast({ msg }) {
   );
 }
 
-// ─── DASHBOARD + LOG (combined) ───────────────────────────────────────────────
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
 function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnapshot }) {
   const last = logRows[logRows.length - 1] ?? null;
   const st   = session?.state ?? {};
-  const cfg  = session?.settings ?? {};
+  const cfg  = normSettings(session?.settings);
 
-  const [price,    setPrice]    = useState(String(last?.price     ?? "19.07"));
-  const [atr,      setAtr]      = useState(String(last?.atr       ?? "2.12"));
-  const [yest,     setYest]     = useState(String(last?.yestClose ?? "18.82"));
+  const [price,    setPrice]    = useState(String(last?.price     ?? ""));
+  const [atr,      setAtr]      = useState(String(last?.atr       ?? ""));
+  const [yest,     setYest]     = useState(String(last?.yestClose ?? ""));
   const [inputTab, setInputTab] = useState("auto");
   const [mSide,    setMSide]    = useState("BUY");
-  const [mPrice,   setMPrice]   = useState(String(last?.price ?? "20.00"));
+  const [mPrice,   setMPrice]   = useState(String(last?.price ?? ""));
   const [mQty,     setMQty]     = useState("10");
   const [err,      setErr]      = useState("");
   const [loading,  setLoading]  = useState(false);
+  useEffect(() => {
+    if (last) {
+      setAtr(String(last.atr ?? ""));
+      setYest(String(last.yestClose ?? ""));
+    }
+  }, [last?.id]);
 
-  // Derived metrics
-  const liveEq   = r2((st.cash ?? 0) + (st.shares ?? 0) * (parseFloat(price) || 0));
-  const unrealPL = r2(((parseFloat(price) || 0) - (st.avgPrice ?? 0)) * (st.shares ?? 0));
-  const dd       = st.peakEquity ? r2((st.peakEquity - liveEq) / st.peakEquity * 100) : 0;
-  const costBasis = r2((st.shares ?? 0) * (st.avgPrice ?? 0));
-  const atrPct   = last ? r2((last.atr / last.price) * 100) : null;
-  const ddRoom   = last ? r2((cfg.maxDrawdown ?? 0.25) * 100 - (last.drawdown ?? 0)) : null;
+  // Live metrics — recalculate whenever price input OR session state changes
+  const priceF    = parseFloat(price) || 0;
+  const shares    = st.shares    ?? 0;
+  const cash      = st.cash      ?? 0;
+  const avgPrice  = st.avgPrice  ?? 0;
+  const peakEq    = st.peakEquity ?? 0;
+
+  const liveEq    = r2(cash + shares * priceF);
+  const unrealPL  = r2((priceF - avgPrice) * shares);
+  const dd        = peakEq > 0 ? r2((peakEq - liveEq) / peakEq * 100) : 0;
+  const costBasis = r2(shares * avgPrice);
+  const atrPct    = last ? r2((last.atr / last.price) * 100) : null;
+  const maxDDPct  = (cfg.maxDrawdown ?? 0.25) * 100;
+  const ddRoom    = last ? r2(maxDDPct - (last.drawdown ?? 0)) : null;
 
   async function runAuto() {
     setErr(""); setLoading(true);
@@ -202,13 +263,16 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
     const res = await apiCall("POST", "/api/trading/tick", { price: p, yest_close: y, atr: a });
     setLoading(false);
     if (res.error) { setErr(String(res.error)); return; }
+    console.log("tick res:", res);
     onRefresh(res.session, res.logRow);
+console.log("session from API:", res.session);
+
   }
 
   async function runManual() {
     setErr(""); setLoading(true);
     const p = parseFloat(mPrice), q = parseInt(mQty);
-    if (isNaN(p) || p <= 0 || isNaN(q) || q < 0) { setErr("Invalid price or qty"); setLoading(false); return; }
+    if (isNaN(p) || p <= 0 || isNaN(q) || q <= 0) { setErr("Invalid price or qty"); setLoading(false); return; }
     const res = await apiCall("POST", "/api/trading/manual", { side: mSide, price: p, qty: q });
     setLoading(false);
     if (res.error) { setErr(String(res.error)); return; }
@@ -218,17 +282,31 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
 
-      {/* ── ROW 1: Position metrics ── */}
+      {/* ROW 1: Position metrics — driven entirely by session.state */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 8 }}>
-        <Metric label="Shares Held"    value={st.shares}           sub={`avg $${r2(st.avgPrice)}`} />
-        <Metric label="Cost Basis"     value={`$${costBasis}`}     color={C.blue} />
-        <Metric label="Cash"           value={`$${r2(st.cash)}`}   color={C.muted} />
-        <Metric label="Live Equity"    value={`$${liveEq}`}        sub={`peak $${r2(st.peakEquity)}`} color={C.blue} />
-        <Metric label="Unrealized P&L" value={`$${unrealPL}`}      color={unrealPL >= 0 ? C.buy : C.red} />
-        <Metric label="Drawdown"       value={`${dd}%`}            danger={dd > 15} sub={ddRoom !== null ? `${ddRoom}% headroom` : undefined} />
+        <Metric label="Shares Held"
+          value={shares}
+          sub={avgPrice > 0 ? `avg $${r2(avgPrice)}` : "no position"} />
+        <Metric label="Cost Basis"
+          value={`$${costBasis}`}
+          color={C.blue} />
+        <Metric label="Cash"
+          value={`$${r2(cash)}`}
+          color={C.muted} />
+        <Metric label="Live Equity"
+          value={`$${liveEq}`}
+          sub={peakEq > 0 ? `peak $${r2(peakEq)}` : undefined}
+          color={C.blue} />
+        <Metric label="Unrealized P&L"
+          value={`$${unrealPL}`}
+          color={unrealPL >= 0 ? C.buy : C.red} />
+        <Metric label="Drawdown"
+          value={`${dd}%`}
+          danger={dd > 15}
+          sub={ddRoom !== null ? `${ddRoom}% headroom` : undefined} />
       </div>
 
-      {/* ── ROW 2: Signal metrics (visible after first tick) ── */}
+      {/* ROW 2: Signal metrics — from last log row */}
       {last && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 8 }}>
           <Metric label="Bias"
@@ -237,16 +315,21 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
           <Metric label="Mom Score"
             value={r2(last.momentumScore)}
             color={Math.abs(last.momentumScore ?? 0) >= 2.5 ? C.amber : C.muted} />
-          <Metric label="ATR %"         value={atrPct !== null ? `${atrPct}%` : "—"} color={C.muted} />
-          <Metric label="Ticks"         value={`${st.tickCount} / ${st.maxTicks}`} color={C.amber} />
-          <Metric label="Last Action"   value={<ActionTag action={last.action} />} />
+          <Metric label="ATR %"
+            value={atrPct !== null ? `${atrPct}%` : "—"}
+            color={C.muted} />
+          <Metric label="Ticks"
+            value={`${last.tick} / ${st.maxTicks}`}
+            color={C.amber} />
+          <Metric label="Last Action"
+            value={<ActionTag action={last.action} />} />
           <Metric label="Realized P&L"
             value={last.realizedPL !== 0 ? `$${r2(last.realizedPL)}` : "—"}
             color={(last.realizedPL ?? 0) > 0 ? C.buy : (last.realizedPL ?? 0) < 0 ? C.red : C.muted} />
         </div>
       )}
 
-      {/* ── Last Signal Panel ── */}
+      {/* Last Signal Panel */}
       {last && (
         <Panel>
           <SectionLabel>Last Signal · {last.date} {last.time}</SectionLabel>
@@ -273,7 +356,6 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
               </Tag>
             )}
           </div>
-
           {(last.buyL1 || last.buyL2 || last.buyL3) && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 5 }}>
               {[last.buyL1, last.buyL2, last.buyL3].filter(Boolean).map((l, i) => (
@@ -291,19 +373,18 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
         </Panel>
       )}
 
-      {/* ── Input Panel ── */}
+      {/* Input Panel */}
       <Panel>
         <TabBar
           tabs={[{ id: "auto", label: "AUTO TICK" }, { id: "manual", label: "MANUAL OVERRIDE" }]}
           active={inputTab} onChange={setInputTab}
         />
-
         {inputTab === "auto" && (
           <>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 12 }}>
-              <Input label="Today's Price"      value={price} onChange={setPrice} />
-              <Input label="ATR"                value={atr}   onChange={setAtr} />
-              <Input label={`Yesterday's Close${last ? " ↺" : ""}`} value={yest} onChange={setYest} />
+              <Input label="Today's Price"     value={price} onChange={setPrice} />
+              <Input label="ATR"               value={atr}   onChange={setAtr} />
+              <Input label="Yesterday's Close" value={yest}  onChange={setYest} />
             </div>
             {err && <div style={{ ...mono, fontSize: 11, color: C.red, marginBottom: 8 }}>{err}</div>}
             <Btn variant="primary" onClick={runAuto} disabled={loading}>
@@ -311,7 +392,6 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
             </Btn>
           </>
         )}
-
         {inputTab === "manual" && (
           <>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 12 }}>
@@ -320,7 +400,8 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
               <Input label="Quantity"   value={mQty}   onChange={setMQty}   step="1" />
             </div>
             {err && <div style={{ ...mono, fontSize: 11, color: C.red, marginBottom: 8 }}>{err}</div>}
-            <Btn variant={mSide === "BUY" ? "primary" : mSide === "SELL" ? "sell" : "default"}
+            <Btn
+              variant={mSide === "BUY" ? "primary" : mSide === "SELL" ? "sell" : "default"}
               onClick={runManual} disabled={loading}>
               {loading ? "Processing…" : `↗ Inject ${mSide}`}
             </Btn>
@@ -328,22 +409,23 @@ function DashboardPage({ session, logRows, onRefresh, onDelete, onUndo, undoSnap
         )}
       </Panel>
 
-      {/* ── Divider ── */}
       <div style={{ borderTop: `1px solid ${C.border}`, margin: "4px 0" }} />
 
-      {/* ── Trade Log (embedded) ── */}
       <TradeLogSection logRows={logRows} onDelete={onDelete} onUndo={onUndo} undoSnapshot={undoSnapshot} />
-
     </div>
   );
 }
 
-// ─── TRADE LOG SECTION ────────────────────────────────────────────────────────
+// ─── TRADE LOG ────────────────────────────────────────────────────────────────
 function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
   const [filter,    setFilter]    = useState("ALL");
   const [expanded,  setExpanded]  = useState(null);
   const [deleteRow, setDeleteRow] = useState("2");
   const [loading,   setLoading]   = useState(false);
+
+  useEffect(() => {
+    if (logRows.length > 0) setExpanded(null);
+  }, [logRows.length]);
 
   const filtered =
     filter === "ALL"  ? logRows :
@@ -354,16 +436,26 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
   async function doDelete() {
     const row = parseInt(deleteRow);
     if (isNaN(row) || row < 2) return;
+
+    const targetRow = logRows[row - 1];
+    if (!targetRow) {
+        alert("Row not found — refresh and try again.");
+        return;
+    }
+    const actualTickNumber = targetRow.tick;
+
     if (!confirm(`Roll back to row ${row - 1}? Rows ${row}+ will be deleted.`)) return;
     setLoading(true);
-    await onDelete(row);
+    await onDelete(actualTickNumber);
     setLoading(false);
-  }
+}
 
   const TH = ({ children, w }) => (
-    <th style={{ padding: "6px 9px", textAlign: "left", color: C.head, whiteSpace: "nowrap",
+    <th style={{
+      padding: "6px 9px", textAlign: "left", color: C.head, whiteSpace: "nowrap",
       borderBottom: `1px solid ${C.border}`, fontSize: 9, textTransform: "uppercase",
-      letterSpacing: "0.1em", fontFamily: "system-ui", fontWeight: 600, minWidth: w }}>
+      letterSpacing: "0.1em", fontFamily: "system-ui", fontWeight: 600, minWidth: w,
+    }}>
       {children}
     </th>
   );
@@ -375,8 +467,6 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-
-      {/* Filter bar + rollback + undo */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span style={{ fontSize: 9, color: C.head, textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: "system-ui" }}>
           Trade Log ({logRows.length})
@@ -392,7 +482,6 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
             {f}{filter === f ? ` (${filtered.length})` : ""}
           </button>
         ))}
-
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
           {undoSnapshot && (
             <Btn variant="amber" onClick={onUndo} style={{ fontSize: 10, padding: "4px 12px" }}>
@@ -400,7 +489,7 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
             </Btn>
           )}
           <span style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: "system-ui" }}>
-            Roll back to row
+            Keep up to row
           </span>
           <input type="number" min="2" value={deleteRow}
             onChange={e => setDeleteRow(e.target.value)}
@@ -412,7 +501,6 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
         </div>
       </div>
 
-      {/* Table */}
       <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
         <div style={{ overflowX: "auto" }}>
           <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 960 }}>
@@ -443,12 +531,12 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
                 </tr>
               )}
               {filtered.map((row, i) => {
-                const isExp  = expanded === (row.id ?? i);
+                const isExp   = expanded === (row.id ?? i);
                 const realIdx = logRows.indexOf(row);
-                const isBuy  = (row.action ?? "").includes("BUY");
-                const isSell = (row.action ?? "").includes("SELL");
-                const dd     = row.drawdown ?? 0;
-                const rpl    = row.realizedPL ?? 0;
+                const isBuy   = (row.action ?? "").includes("BUY");
+                const isSell  = (row.action ?? "").includes("SELL");
+                const dd      = row.drawdown ?? 0;
+                const rpl     = row.realizedPL ?? 0;
                 return [
                   <tr key={row.id ?? i}
                     onClick={() => setExpanded(isExp ? null : (row.id ?? i))}
@@ -459,7 +547,7 @@ function TradeLogSection({ logRows, onDelete, onUndo, undoSnapshot }) {
                       borderLeft: `2px solid ${isBuy ? C.buy : isSell ? C.sell : "transparent"}`,
                     }}
                   >
-                    <TD color={C.muted}>{realIdx + 2}</TD>
+                    <TD color={C.muted}>{realIdx + 1}</TD>
                     <TD>{row.date} {row.time}</TD>
                     <TD>{row.price}</TD>
                     <TD color={C.muted}>{row.atr}</TD>
@@ -567,7 +655,6 @@ function AnalyticsPage({ logRows }) {
         <Metric label="Start Equity" value={`$${firstEq}`} />
         <Metric label="End Equity"   value={`$${lastEq}`}  color={lastEq >= firstEq ? C.buy : C.red} />
       </div>
-
       <Panel>
         <SectionLabel>Equity Curve</SectionLabel>
         <ResponsiveContainer width="100%" height={160}>
@@ -585,7 +672,6 @@ function AnalyticsPage({ logRows }) {
           </AreaChart>
         </ResponsiveContainer>
       </Panel>
-
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         <Panel>
           <SectionLabel>Price vs Avg Cost Basis</SectionLabel>
@@ -618,7 +704,6 @@ function AnalyticsPage({ logRows }) {
           </ResponsiveContainer>
         </Panel>
       </div>
-
       {logRows.some(r => (r.realizedPL ?? 0) !== 0) && (
         <Panel>
           <SectionLabel>Realized P&L per Trade</SectionLabel>
@@ -643,18 +728,46 @@ function AnalyticsPage({ logRows }) {
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
 function SettingsPage({ session, onSaved }) {
-  const cfg = session?.settings ?? {};
+  const cfg = normSettings(session?.settings);
+
   const [s, setS] = useState({
-    ticker:            cfg.ticker           ?? "QBTS",
-    initial_shares:    cfg.initialShares    ?? 171,
-    initial_cash:      cfg.initialCash      ?? 0,
-    trade_fee:         cfg.tradeFee         ?? 5,
-    atr_levels:        cfg.atrLevels        ?? [0.5, 1.0, 1.5],
-    base_fractions:    cfg.baseFractions    ?? [0.3, 0.4, 0.3],
-    max_drawdown:      (cfg.maxDrawdown     ?? 0.25) * 100,
-    momentum_lookback: cfg.momentumLookback ?? 3,
-    max_ticks:         cfg.maxTicks         ?? 50,
+    ticker:              cfg.ticker,
+    initial_shares:      cfg.initialShares,
+    initial_cash:        cfg.initialCash,
+    trade_fee:           cfg.tradeFee,
+    min_fee_cover:       cfg.minFeeCover,
+    min_move_atr_mult:   cfg.minMoveAtrMult,
+    atr_levels:          cfg.atrLevels,
+    base_fractions:      cfg.baseFractions,
+    max_drawdown:        cfg.maxDrawdown * 100,   // store as % for display
+    momentum_lookback:   cfg.momentumLookback,
+    strong_mom_lookback: cfg.strongMomLookback,
+    min_qty:             cfg.minQty,
+    min_buy_dip_pct:     cfg.minBuyDipPct,
+    max_ticks:           cfg.maxTicks,
   });
+
+  // Re-sync if session prop changes (e.g. after reset)
+  useEffect(() => {
+    const c = normSettings(session?.settings);
+    setS({
+      ticker:              c.ticker,
+      initial_shares:      c.initialShares,
+      initial_cash:        c.initialCash,
+      trade_fee:           c.tradeFee,
+      min_fee_cover:       c.minFeeCover,
+      min_move_atr_mult:   c.minMoveAtrMult,
+      atr_levels:          c.atrLevels,
+      base_fractions:      c.baseFractions,
+      max_drawdown:        c.maxDrawdown * 100,
+      momentum_lookback:   c.momentumLookback,
+      strong_mom_lookback: c.strongMomLookback,
+      min_qty:             c.minQty,
+      min_buy_dip_pct:     c.minBuyDipPct,
+      max_ticks:           c.maxTicks,
+    });
+  }, [session?.id]);
+
   const [saved,   setSaved]   = useState(false);
   const [loading, setLoading] = useState(false);
 
@@ -663,57 +776,86 @@ function SettingsPage({ session, onSaved }) {
 
   async function save() {
     setLoading(true);
-    const res = await apiCall("PUT", "/api/trading/settings", { ...s, max_drawdown: s.max_drawdown / 100 });
+    // Send snake_case to backend, convert max_drawdown back to decimal
+    const res = await apiCall("PUT", "/api/trading/settings", {
+      ...s,
+      max_drawdown: s.max_drawdown / 100,
+    });
     setLoading(false);
-    if (!res.error) { setSaved(true); setTimeout(() => setSaved(false), 2500); onSaved(res.session); }
+    if (!res.error) {
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+      onSaved(res.session);
+    }
   }
 
   const inp = { fontFamily: "monospace", fontSize: 13, background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: "7px 10px", width: "100%", outline: "none" };
   const lbl = { fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 5, fontFamily: "system-ui" };
+
+  const fractionSum = s.base_fractions.reduce((a, v) => a + (parseFloat(v) || 0), 0);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, maxWidth: 660 }}>
       <Panel>
         <SectionLabel>Identity & Fees</SectionLabel>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-          <div><div style={lbl}>Ticker</div><input type="text"   value={s.ticker}         onChange={e => set("ticker", e.target.value)}          style={inp} /></div>
-          <div><div style={lbl}>Initial Shares</div><input type="number" value={s.initial_shares} onChange={e => set("initial_shares", +e.target.value)} style={inp} /></div>
-          <div><div style={lbl}>Initial Cash ($)</div><input type="number" value={s.initial_cash}   onChange={e => set("initial_cash", +e.target.value)}   style={inp} /></div>
-          <div><div style={lbl}>Trade Fee ($)</div><input type="number" step="0.5" value={s.trade_fee} onChange={e => set("trade_fee", +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Ticker</div>
+            <input type="text"   value={s.ticker}             onChange={e => set("ticker", e.target.value)}             style={inp} /></div>
+          <div><div style={lbl}>Initial Shares</div>
+            <input type="number" value={s.initial_shares}     onChange={e => set("initial_shares",     +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Initial Cash ($)</div>
+            <input type="number" value={s.initial_cash}       onChange={e => set("initial_cash",       +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Trade Fee ($)</div>
+            <input type="number" step="0.5" value={s.trade_fee}       onChange={e => set("trade_fee",        +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Min Fee Cover ($)</div>
+            <input type="number" step="0.5" value={s.min_fee_cover}   onChange={e => set("min_fee_cover",    +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Min Move ATR Mult</div>
+            <input type="number" step="0.01" value={s.min_move_atr_mult} onChange={e => set("min_move_atr_mult", +e.target.value)} style={inp} /></div>
         </div>
 
         <SectionLabel>Algorithm Parameters</SectionLabel>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
-          <div><div style={lbl}>Max Drawdown Stop (%)</div><input type="number" step="1"  value={s.max_drawdown}      onChange={e => set("max_drawdown", +e.target.value)}      style={inp} /></div>
-          <div><div style={lbl}>Momentum Lookback</div>   <input type="number"       value={s.momentum_lookback} onChange={e => set("momentum_lookback", +e.target.value)} style={inp} /></div>
-          <div><div style={lbl}>Max Ticks in Memory</div> <input type="number"       value={s.max_ticks}         onChange={e => set("max_ticks", +e.target.value)}         style={inp} /></div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 16 }}>
+          <div><div style={lbl}>Max Drawdown Stop (%)</div>
+            <input type="number" step="1"    value={s.max_drawdown}        onChange={e => set("max_drawdown",        +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Momentum Lookback</div>
+            <input type="number"             value={s.momentum_lookback}   onChange={e => set("momentum_lookback",   +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Strong Mom Lookback</div>
+            <input type="number"             value={s.strong_mom_lookback} onChange={e => set("strong_mom_lookback", +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Min Qty</div>
+            <input type="number"             value={s.min_qty}             onChange={e => set("min_qty",             +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Min Buy Dip %</div>
+            <input type="number" step="0.01" value={s.min_buy_dip_pct}    onChange={e => set("min_buy_dip_pct",    +e.target.value)} style={inp} /></div>
+          <div><div style={lbl}>Max Ticks in Memory</div>
+            <input type="number"             value={s.max_ticks}           onChange={e => set("max_ticks",           +e.target.value)} style={inp} /></div>
         </div>
 
         <SectionLabel>ATR Ladder Multipliers</SectionLabel>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 16 }}>
-          {[0,1,2].map(i => (
-            <div key={i}><div style={lbl}>Level {i+1}</div>
+          {[0, 1, 2].map(i => (
+            <div key={i}><div style={lbl}>Level {i + 1}</div>
               <input type="number" step="0.1" value={s.atr_levels[i]} onChange={e => setArr("atr_levels", i, +e.target.value)} style={inp} />
             </div>
           ))}
         </div>
 
         <SectionLabel>Ladder Size Fractions (sum ≈ 1)</SectionLabel>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 18 }}>
-          {[0,1,2].map(i => (
-            <div key={i}><div style={lbl}>Level {i+1}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 10 }}>
+          {[0, 1, 2].map(i => (
+            <div key={i}><div style={lbl}>Level {i + 1}</div>
               <input type="number" step="0.05" min="0" max="1" value={s.base_fractions[i]} onChange={e => setArr("base_fractions", i, +e.target.value)} style={inp} />
             </div>
           ))}
         </div>
-        <div style={{ fontSize: 9, color: C.muted, marginBottom: 14, fontFamily: "system-ui" }}>
-          Sum: {r2(s.base_fractions.reduce((a, v) => a + (parseFloat(v) || 0), 0))}
-          {Math.abs(s.base_fractions.reduce((a, v) => a + v, 0) - 1) > 0.01 &&
+        <div style={{ fontSize: 9, color: C.muted, marginBottom: 16, fontFamily: "system-ui" }}>
+          Sum: {r2(fractionSum)}
+          {Math.abs(fractionSum - 1) > 0.01 &&
             <span style={{ color: C.red, marginLeft: 8 }}>⚠ should sum to 1.0</span>}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <Btn variant="primary" onClick={save} disabled={loading}>{loading ? "Saving…" : "↗ Save Settings"}</Btn>
+          <Btn variant="primary" onClick={save} disabled={loading}>
+            {loading ? "Saving…" : "↗ Save Settings"}
+          </Btn>
           {saved && <span style={{ ...mono, fontSize: 11, color: C.buy }}>✓ Saved</span>}
         </div>
       </Panel>
@@ -736,9 +878,13 @@ export default function Dashboard({ session: initSession, logRows: initLogRows }
   const [resetting,    setResetting]    = useState(false);
   const [undoSnapshot, setUndoSnapshot] = useState(null);
 
-  const st = session?.state ?? {};
+  const st  = session?.state    ?? {};
+  const cfg = normSettings(session?.settings);
 
-  function showToast(msg) { setToast(msg ?? ""); setTimeout(() => setToast(""), 3000); }
+  function showToast(msg) {
+    setToast(msg ?? "");
+    setTimeout(() => setToast(""), 3000);
+  }
 
   const handleRefresh = useCallback((newSession, newLogRow) => {
     if (newSession) setSession(newSession);
@@ -746,17 +892,25 @@ export default function Dashboard({ session: initSession, logRows: initLogRows }
     showToast(newLogRow?.action ?? "Tick processed");
   }, []);
 
-  const handleDelete = useCallback(async (rowNum) => {
+const handleDelete = useCallback(async (rowNum) => {
+    console.log('[DELETE] firing with row_number:', rowNum);
+    console.log('[DELETE] current session state:', JSON.stringify(session));
+    console.log('[DELETE] current logRows count:', logRows.length);
+
     setUndoSnapshot({ rows: logRows, session });
     const res = await apiCall("POST", "/api/trading/delete-tick", { row_number: rowNum });
+
+    console.log('[DELETE] response:', JSON.stringify(res));
+
     if (!res.error) {
-      setSession(res.session ?? session);
-      setLogRows(res.logRows ?? []);
-      showToast(`↺ Rolled back to row ${rowNum - 1} — Undo available`);
+        setSession(res.session ?? session);
+        setLogRows(res.logRows ?? []);
+        showToast(`↺ Kept up to row ${rowNum - 1}, deleted row ${rowNum}+`);
     } else {
-      setUndoSnapshot(null);
+        setUndoSnapshot(null);
+        showToast("Rollback failed");
     }
-  }, [logRows, session]);
+}, [logRows, session]);
 
   function handleUndo() {
     if (!undoSnapshot) return;
@@ -791,7 +945,7 @@ export default function Dashboard({ session: initSession, logRows: initLogRows }
           ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 3px; }
         `}</style>
 
-        {/* Header */}
+        {/* ── Nav bar ── */}
         <div style={{
           borderBottom: `1px solid ${C.border}`, padding: "0 24px",
           display: "flex", alignItems: "center", height: 52,
@@ -807,7 +961,7 @@ export default function Dashboard({ session: initSession, logRows: initLogRows }
             }}>L</div>
             <div>
               <div style={{ ...mono, fontSize: 12, fontWeight: 600, color: C.text, letterSpacing: "0.08em" }}>
-                {session?.settings?.ticker ?? "—"}
+                {cfg.ticker ?? "—"}
                 <span style={{ color: C.muted, fontWeight: 400, marginLeft: 8 }}>Ladder Trading</span>
               </div>
               <div style={{ fontSize: 9, color: C.muted, fontFamily: "system-ui", letterSpacing: "0.06em", marginTop: 1 }}>
@@ -835,7 +989,6 @@ export default function Dashboard({ session: initSession, logRows: initLogRows }
           </Btn>
         </div>
 
-        {/* Body */}
         <div style={{ maxWidth: 1320, margin: "0 auto", padding: "20px 24px" }}>
           {page === "dashboard" && (
             <DashboardPage

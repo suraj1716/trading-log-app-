@@ -128,6 +128,11 @@ class TradingEngine
         $momentumScore = 0;
         $bias = 'NONE';
 
+        // Position underwater % from avg buy price
+        $positionDD = ($avgPrice > 0 && $shares > 0)
+            ? ($avgPrice - $price) / $avgPrice
+            : 0;
+
         if ($manual) {
             $side = $manual['side'];
             $qty = $manual['qty'];
@@ -157,7 +162,40 @@ class TradingEngine
                 $absScore = min(abs($score), 4);
                 $ladderPct = 0.2 + 0.075 * $absScore;
 
-                if ($sig === -1 && $cash > $price) {
+                // ── DOWNTREND RESCUE: position underwater thresholds ──
+                if ($sig === -1 && $shares > 0 && $positionDD >= 0.25 && $cash < $price) {
+                    // 25%+ underwater + no cash → sell 30% to fund dip buying
+                    $sellQty = (int) floor($shares * 0.30);
+                    if ($sellQty > 0) {
+                        $realizedPL = self::r2(($price - $avgPrice) * $sellQty - $tradeFee);
+                        $cash += $sellQty * $price - $tradeFee;
+                        $shares -= $sellQty;
+                        $action = "RESCUE SELL $sellQty → buying dips";
+                    }
+                    // Use freed cash to ladder buy
+                    $remCash = $cash * $ladderPct;
+                    foreach ($cfg['atrLevels'] as $j => $m) {
+                        $p = self::r2($price - $m * $atr);
+                        $q = (int) floor(($remCash * $cfg['baseFractions'][$j]) / $p);
+                        if ($q > 0) $buyLegs[$j] = ['p' => $p, 'q' => $q];
+                    }
+
+                } elseif ($sig === -1 && $positionDD >= 0.15 && $positionDD < 0.25 && $cash >= $price) {
+                    // 15-25% underwater + has cash → ladder buy only, no sell
+                    $remCash = $cash * $ladderPct;
+                    foreach ($cfg['atrLevels'] as $j => $m) {
+                        $p = self::r2($price - $m * $atr);
+                        $q = (int) floor(($remCash * $cfg['baseFractions'][$j]) / $p);
+                        if ($q > 0) $buyLegs[$j] = ['p' => $p, 'q' => $q];
+                    }
+                    $action = "DIP LADDER (15-25% down)";
+
+                } elseif ($sig === -1 && $positionDD >= 0.40) {
+                    // 40%+ underwater → stop all buying, just hold
+                    $holdReason = 'position -40% underwater, holding';
+
+                } elseif ($sig === -1 && $strongSig !== 1 && $cash > $price) {
+                    // Normal downtrend buy (strong mom not opposing)
                     $mainCash = $cash * 0.5;
                     $qty = (int) floor($mainCash / $price);
                     $cost = $qty * $price;
@@ -166,7 +204,9 @@ class TradingEngine
                         $prev = $shares;
                         $shares += $qty;
                         $avgPrice = $avgPrice ? ($avgPrice * $prev + $cost) / $shares : $price;
-                        $action = abs($score) >= 3 ? "STRONG MOM BUY $qty = $" . self::r2($cost) : "MOM BUY $qty = $" . self::r2($cost);
+                        $action = abs($score) >= 3
+                            ? "STRONG MOM BUY $qty = $" . self::r2($cost)
+                            : "MOM BUY $qty = $" . self::r2($cost);
                     }
                     $remCash = $cash * $ladderPct;
                     foreach ($cfg['atrLevels'] as $j => $m) {
@@ -174,14 +214,18 @@ class TradingEngine
                         $q = (int) floor(($remCash * $cfg['baseFractions'][$j]) / $p);
                         if ($q > 0) $buyLegs[$j] = ['p' => $p, 'q' => $q];
                     }
-                } elseif ($sig === 1 && $shares > 0) {
+
+                } elseif ($sig === 1 && $strongSig !== -1 && $shares > 0) {
+                    // Normal uptrend sell (strong mom not opposing)
                     $mainPct = 0.5 - 0.075 * $absScore;
                     $qty = (int) floor($shares * $mainPct);
                     if ($qty > 0) {
                         $realizedPL = self::r2(($price - $avgPrice) * $qty - $tradeFee);
                         $cash += $qty * $price - $tradeFee;
                         $shares -= $qty;
-                        $action = abs($score) >= 3 ? "STRONG MOM SELL $qty" : "MOM SELL $qty";
+                        $action = abs($score) >= 3
+                            ? "STRONG MOM SELL $qty"
+                            : "MOM SELL $qty";
                     }
                     $remShares = (int) floor($shares * $ladderPct);
                     foreach ($cfg['atrLevels'] as $j => $m) {
@@ -189,11 +233,13 @@ class TradingEngine
                         $q = min((int) floor($remShares * $cfg['baseFractions'][$j]), $remShares);
                         if ($q > 0) $sellLegs[$j] = ['p' => $p, 'q' => $q];
                     }
+
                 } else {
                     if ($sig === 0) $holdReason = 'no momentum';
                     elseif ($sig === -1 && $cash <= $price) $holdReason = 'no cash';
                     elseif ($sig === 1 && $shares <= 0) $holdReason = 'no shares';
                 }
+
             } else {
                 $holdReason = 'drawdown limit';
             }
@@ -229,6 +275,8 @@ class TradingEngine
                 'action' => $action,
                 'bias' => $bias,
                 'momentum_score' => $momentumScore,
+            // add this new columnbto DB migration to log, then uncomment
+                //'position_dd_pct' => self::r2($positionDD * 100),
                 'buy_l1_price' => $buyLegs[0]['p'] ?? null,
                 'buy_l1_qty' => $buyLegs[0]['q'] ?? null,
                 'buy_l2_price' => $buyLegs[1]['p'] ?? null,
